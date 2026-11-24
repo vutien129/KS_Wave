@@ -1,0 +1,199 @@
+//@version=6
+indicator('KS-Wave [Kinetic Structural Wave v2.1]', 'KS-Wave', overlay = true, scale = scale.right, max_labels_count = 500)
+
+// ==========================================
+// 1. INPUT CONFIGURATION & PROFILE PRESETS
+// ==========================================
+grp_preset = '1. Preset Profile Selection'
+preset = input.string('Day Trading (M15 - M30)', 'Operational Profile', options = ['Scalping (M1 - M5)', 'Day Trading (M15 - M30)', 'Swing Trading (H1 - H4)', 'Position Trading (D1)', 'Custom'], group = grp_preset)
+
+grp_custom = '2. Manual Overrides (Active When \'Custom\' Selected)'
+c_len = input.int(14, 'Momentum Lookback Length', minval = 5, group = grp_custom)
+c_kBase = input.float(2.2, 'Base Distance Multiplier', step = 0.1, group = grp_custom)
+c_pivLen = input.int(5, 'Structural Pivot Lookback', minval = 2, group = grp_custom)
+
+grp_ui = '3. Display & Aesthetics'
+showFill = input.bool(true, 'Highlight Trend Cloud Fill', group = grp_ui)
+showFlip = input.bool(true, 'Show Bar-Close Flip Labels', group = grp_ui)
+showDash = input.bool(true, 'Show Diagnostic HUD Panel', group = grp_ui)
+
+// ==========================================
+// 2. PROFILE INITIALIZATION & TUNING
+// ==========================================
+var int len = 14
+var float k_base = 2.2
+var int pivLen = 5
+
+if preset == 'Scalping (M1 - M5)'
+    len := 24
+    k_base := 2.6
+    pivLen := 7
+    pivLen
+else if preset == 'Day Trading (M15 - M30)'
+    len := 14
+    k_base := 2.2
+    pivLen := 5
+    pivLen
+else if preset == 'Swing Trading (H1 - H4)'
+    len := 12
+    k_base := 1.9
+    pivLen := 4
+    pivLen
+else if preset == 'Position Trading (D1)'
+    len := 28
+    k_base := 2.8
+    pivLen := 5
+    pivLen
+else
+    len := c_len
+    k_base := c_kBase
+    pivLen := c_pivLen
+    pivLen
+
+// ==========================================
+// 3. SYNTHETIC HEIKIN-BODY CENTROID (P_CORE)
+// ==========================================
+var float o_ha = open
+float c_ha = (open + high + low + close) / 4.0
+o_ha := barstate.isfirst ? open : (nz(o_ha[1], open) + nz(c_ha[1], close)) / 2.0
+float p_core = (o_ha + high + low + 2.0 * close) / 5.0
+
+// ==========================================
+// 4. KINETIC EFFICIENCY RATIO (KER) & ADAPTIVE CENTERLINE (ACL)
+// ==========================================
+float chgTotal = math.abs(p_core - nz(p_core[len], p_core))
+float volTotal = 0.0
+for i = 0 to len - 1 by 1
+    volTotal := volTotal + math.abs(p_core[i] - p_core[i + 1])
+    volTotal
+
+float ker = volTotal == 0.0 ? 0.0 : math.min(1.0, chgTotal / volTotal)
+
+float fastAlpha = 2.0 / (2.0 + 1.0)
+float slowAlpha = 2.0 / (len + 1.0)
+float alpha = math.pow(ker * (fastAlpha - slowAlpha) + slowAlpha, 2)
+
+var float acl = p_core
+acl := barstate.isfirst ? p_core : nz(acl[1], p_core) + alpha * (p_core - nz(acl[1], p_core))
+
+// ==========================================
+// 5. ASYMMETRIC DIRECTIONAL VOLATILITY & ADAPTIVE BANDS
+// ==========================================
+float v_down = math.max(high - low, math.abs(nz(close[1], close) - low))
+float v_up = math.max(high - low, math.abs(high - nz(close[1], close)))
+
+float atr_down = ta.ema(v_down, len)
+float atr_up = ta.ema(v_up, len)
+
+// Dynamic expansion coefficient: contracts during momentum, expands in chop
+float k_dyn = k_base * (1.6 - 0.8 * ker)
+
+float band_down = atr_down * k_dyn
+float band_up = atr_up * k_dyn
+
+// Structural swing anchors to prevent wickouts
+float floor_pivot = ta.lowest(low, pivLen)
+float ceil_pivot = ta.highest(high, pivLen)
+
+// ==========================================
+// 6. RATCHET TRAILING WAVE ENGINE
+// ==========================================
+var float ksWave = na
+var int ksTrend = 1
+
+if barstate.isfirst
+    ksWave := acl
+    ksTrend := 1
+    ksTrend
+else
+    if ksTrend == 1
+        float candidate = math.max(acl - band_down, floor_pivot)
+        ksWave := math.max(nz(ksWave[1], candidate), candidate)
+        if close < ksWave
+            ksTrend := -1
+            ksWave := math.min(acl + band_up, ceil_pivot)
+            ksWave
+    else
+        float candidate = math.min(acl + band_up, ceil_pivot)
+        ksWave := math.min(nz(ksWave[1], candidate), candidate)
+        if close > ksWave
+            ksTrend := 1
+            ksWave := math.max(acl - band_down, floor_pivot)
+            ksWave
+
+// ==========================================
+// 7. WAVE PLOTTING & VISUAL RENDERING
+// ==========================================
+color colTrend = ksTrend == 1 ? #00E676 : #FF1744
+plotWave = plot(ksWave, 'KS-Wave Trailing Line', color = colTrend, linewidth = 2, style = plot.style_line)
+plotPrice = plot(close, 'Price Anchor', display = display.none)
+
+color fillCol = ksTrend == 1 ? color.new(#00E676, 88) : color.new(#FF1744, 88)
+fill(plotWave, plotPrice, color = showFill ? fillCol : na, title = 'Trend Cloud Highlight')
+
+// ==========================================
+// 8. SIGNALS & CONFIRMED BAR-CLOSE ALERTS
+// ==========================================
+// Generate standard MT5-compatible timeframe string
+f_getTfStr() =>
+    if timeframe.isminutes
+        if timeframe.multiplier >= 60 and timeframe.multiplier % 60 == 0
+            'PERIOD_H' + str.tostring(timeframe.multiplier / 60)
+        else
+            'PERIOD_M' + str.tostring(timeframe.multiplier)
+    else if timeframe.isdaily
+        'PERIOD_D' + str.tostring(timeframe.multiplier)
+    else if timeframe.isweekly
+        'PERIOD_W' + str.tostring(timeframe.multiplier)
+    else if timeframe.ismonthly
+        'PERIOD_MN' + str.tostring(timeframe.multiplier)
+    else
+        'PERIOD_' + timeframe.period
+
+// Format price decimals dynamically
+f_priceStr(float val) =>
+    syminfo.mintick < 0.001 ? str.tostring(val, '#.#####') : str.tostring(val, '#.###')
+
+bool flipToUp = ksTrend == 1 and ksTrend[1] == -1
+bool flipToDown = ksTrend == -1 and ksTrend[1] == 1
+
+// Only trigger alerts and static labels on confirmed closed bars
+bool buyConfirmed = flipToUp and barstate.isconfirmed
+bool sellConfirmed = flipToDown and barstate.isconfirmed
+
+// Render chart labels exclusively on confirmed bars (no flickering on live bar)
+if showFlip and flipToUp and (barstate.isconfirmed or not barstate.islast)
+    label.new(x = bar_index, y = na, text = '▲ BUY\n' + f_priceStr(close), yloc = yloc.belowbar, color = #00E676, textcolor = color.black, style = label.style_label_up, size = size.tiny)
+
+if showFlip and flipToDown and (barstate.isconfirmed or not barstate.islast)
+    label.new(x = bar_index, y = na, text = '▼ SELL\n' + f_priceStr(close), yloc = yloc.abovebar, color = #FF1744, textcolor = color.white, style = label.style_label_down, size = size.tiny)
+
+// Unified alert payload matching target syntax
+if buyConfirmed
+    string msgBuy = syminfo.ticker + ' ' + f_getTfStr() + ' | BUY: entry ' + f_priceStr(close) + ' --stoploss ' + f_priceStr(ksWave)
+    alert(msgBuy, alert.freq_once_per_bar_close)
+
+if sellConfirmed
+    string msgSell = syminfo.ticker + ' ' + f_getTfStr() + ' | SELL: entry ' + f_priceStr(close) + ' --stoploss ' + f_priceStr(ksWave)
+    alert(msgSell, alert.freq_once_per_bar_close)
+
+alertcondition(buyConfirmed, 'KS-Wave BUY (Bar Close Only)', '{{ticker}} | BUY Confirmed')
+alertcondition(sellConfirmed, 'KS-Wave SELL (Bar Close Only)', '{{ticker}} | SELL Confirmed')
+
+// ==========================================
+// 9. REAL-TIME DIAGNOSTIC HUD TABLE
+// ==========================================
+var table infoBox = table.new(position.top_right, 2, 4, bgcolor = color.new(#131722, 20), border_color = color.gray, border_width = 1)
+if showDash and barstate.islast
+    table.cell(infoBox, 0, 0, 'Operational Profile', text_color = color.silver, text_size = size.small)
+    table.cell(infoBox, 1, 0, preset, text_color = color.white, text_size = size.small)
+
+    table.cell(infoBox, 0, 1, 'Active Trend State', text_color = color.silver, text_size = size.small)
+    table.cell(infoBox, 1, 1, ksTrend == 1 ? 'BULLISH (Up)' : 'BEARISH (Down)', text_color = colTrend, text_size = size.small)
+
+    table.cell(infoBox, 0, 2, 'Kinetic Efficiency (KER)', text_color = color.silver, text_size = size.small)
+    string kerState = ker >= 0.6 ? 'Strong Trend' : ker <= 0.3 ? 'Chop / Sideways' : 'Moderate'
+    table.cell(infoBox, 1, 2, str.tostring(ker * 100, '#.0') + '% (' + kerState + ')', text_color = color.white, text_size = size.small)
+
+    table.cell(infoBox, 0, 3, 'Dynamic Multiplier (k)', text_color = color.silver, text_size = size.small)
+    table.cell(infoBox, 1, 3, str.tostring(k_dyn, '#.##') + 'x', text_color = color.yellow, text_size = size.small)
